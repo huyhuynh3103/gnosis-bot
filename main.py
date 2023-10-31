@@ -1,12 +1,21 @@
 from web3 import Web3
 from dotenv import load_dotenv
+from typing import Dict
 import os
 from web3.middleware import geth_poa_middleware
 from gnosis.eth import EthereumClient
 from gnosis.safe import Safe
 import logging
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+    PicklePersistence,
+    ConversationHandler,
+    CallbackQueryHandler,
+    MessageHandler
+)
 
 # Enable logging
 logging.basicConfig(
@@ -37,14 +46,90 @@ ethereum_client = EthereumClient(RPC_URL)
 safe = Safe(SAFE_ADDRESS, ethereum_client)
 staking_proxy = w3.eth.contract(address=STAKING_PROXY, abi=STAKING_ABI)
 
+# state definitions
+SELECTING_ACTION, SELECTING_NETWORK, SET_SAFE_WALLET, CHOOSE_OWNER, SET_DURATION = map(chr, range(5))
+MAINNET, TESTNET = map(chr, range(5, 7))
+START_OVER, SHOWING = map(chr, range(7, 9))
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Sends explanation on how to use the bot."""
-    await update.message.reply_text("Hi! Use /set <seconds> to set a timer")
+END = ConversationHandler.END
 
 
-async def alarm(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Send the alarm message."""
+def facts_to_str(user_data: Dict[str, str]) -> str:
+    """Helper function for formatting the gathered user info."""
+    facts = [f"{key} - {value}" for key, value in user_data.items()]
+    return "\n".join(facts).join(["\n", "\n"])
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> str:
+    guideline_text = ("You may choose to set your network, safe wallet, signer address, and duration for this job.")
+    buttons = [
+        [
+            InlineKeyboardButton(text="Choose network", callback_data=str(SELECTING_NETWORK)),
+            InlineKeyboardButton(text="Set safe wallet", callback_data=str(SET_SAFE_WALLET))
+        ],
+        [
+            InlineKeyboardButton(text="Choose safe wallet owner", callback_data=str(CHOOSE_OWNER)),
+            InlineKeyboardButton(text="Set duration", callback_data=str(SET_DURATION))
+        ],
+        [
+            InlineKeyboardButton(text="Show config", callback_data=str(SHOWING))
+        ],
+        [
+            InlineKeyboardButton(text="Done", callback_data=str(END))
+        ]
+    ]
+
+    keyboard = InlineKeyboardMarkup(buttons)
+    if context.user_data.get(START_OVER):
+        await update.callback_query.answer()
+        await update.callback_query.edit_message_text(text=guideline_text, reply_markup=keyboard)
+    else:
+        await update.message.reply_text(
+            "Hi, I'm Gnosis Bot and I'm here to help you staking your RON every day."
+        )
+        await update.message.reply_text(text=guideline_text, reply_markup=keyboard)
+
+    context.user_data[START_OVER] = False
+    return SELECTING_ACTION
+
+
+async def show_data(update: Update, context: ContextTypes.DEFAULT_TYPE) -> str:
+    """Pretty print gathered data."""
+    user_data = context.user_data
+    text = f"Setting data: {facts_to_str(context.user_data)}"
+    buttons = [[InlineKeyboardButton(text="Back", callback_data=str(END))]]
+    keyboard = InlineKeyboardMarkup(buttons)
+    await update.callback_query.answer()
+    await update.callback_query.edit_message_text(text=text, reply_markup=keyboard)
+    user_data[START_OVER] = True
+    return SHOWING
+
+
+async def end_second_level(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Return to top level conversation."""
+    context.user_data[START_OVER] = True
+    await start(update, context)
+
+    return END
+
+
+async def select_network(update: Update, context: ContextTypes.DEFAULT_TYPE) -> str:
+    """Select network between ronin-test and ronin-mainnet"""
+    text = "Select your network"
+    buttons = [
+        [
+            InlineKeyboardButton(text=f"Ronin Mainnet", callback_data=str(MAINNET)),
+            InlineKeyboardButton(text=f"Ronin Testnet", callback_data=str(TESTNET)),
+        ],
+        [
+            InlineKeyboardButton(text="Back", callback_data=str(END)),
+        ],
+    ]
+    keyboard = InlineKeyboardMarkup(buttons)
+    await update.callback_query.answer()
+    await update.callback_query.edit_message_text(text=text, reply_markup=keyboard)
+
+    return SELECTING_NETWORK
 
 
 def remove_job_if_exists(name: str, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -57,7 +142,7 @@ def remove_job_if_exists(name: str, context: ContextTypes.DEFAULT_TYPE) -> bool:
     return True
 
 
-async def set_timer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def set_duration(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Add a job to the queue."""
     chat_id = update.effective_message.chat_id
     try:
@@ -72,7 +157,7 @@ async def set_timer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.effective_message.reply_text(text)
 
     except (IndexError, ValueError):
-        await update.effective_message.reply_text("Usage: /set <seconds>")
+        await update.effective_message.reply_text("Error when set duration! Please try again")
 
 
 async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -107,9 +192,37 @@ async def call_staking(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 def main():
     # Create the telegram bot application
-    application = Application.builder().token(telegram_token).build()
-    application.add_handler(CommandHandler(["start", "help"], start))
-    application.add_handler(CommandHandler("set", set_timer))
+    persistence = PicklePersistence(filepath="gnosis-bot")
+    application = Application.builder().token(telegram_token).persistence(persistence=persistence).build()
+
+    select_network_handler = ConversationHandler(
+        entry_points=[CallbackQueryHandler(select_network, pattern="^" + str(SELECTING_NETWORK) + "$")],
+        states={},
+        fallbacks=[],
+        map_to_parent={
+            END: SELECTING_ACTION
+        },
+        name="select-network",
+        persistent=True
+    )
+
+    main_handler = ConversationHandler(
+        entry_points=[
+            CommandHandler("start", start),
+        ],
+        states={
+            SELECTING_ACTION: [
+                CallbackQueryHandler(show_data, pattern="^" + str(SHOWING) + "$"),
+                select_network_handler
+            ]
+        },
+        fallbacks=[
+            CommandHandler("stop", stop)
+        ],
+        name="gnosis-bot-setting",
+        persistent=True,
+    )
+    application.add_handler(main_handler)
     application.add_handler(CommandHandler("stop", stop))
 
     # Run the bot until the user presses Ctrl-C
